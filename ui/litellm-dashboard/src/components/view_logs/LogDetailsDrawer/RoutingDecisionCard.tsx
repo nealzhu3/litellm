@@ -84,6 +84,7 @@ function describeReasoningOverride(tierLabel: string | undefined, floor: number 
 
 const CONSTANT_CAUSE_LABELS: Record<string, string> = {
   heuristic_scorer: "Heuristic scorer",
+  insufficient_evidence: "Heuristic scorer, defaulted on insufficient evidence",
   heuristic_first_short_circuit: "Heuristic scorer, classifier skipped",
   classifier_plugin: "Custom classifier plugin",
   semantic_keyword_match: "Semantic keyword match",
@@ -170,11 +171,16 @@ export function RoutingDecisionCard({
     tier_boundaries: tierBoundaries,
   } = decision;
 
-  // On an override row the score did not decide the tier, so showing it against a
-  // boundary would claim something untrue. Keyed off the cause rather than a marker
-  // inside `signals`, which redaction can remove.
+  // On these rows the score did not decide the tier (an override forced it, or scorer v2
+  // defaulted below the boundary), so showing it against a boundary would claim something
+  // untrue. Keyed off the cause rather than a marker inside `signals`, which redaction can
+  // remove.
+  const scoreDidNotDecide =
+    decision.cause === "reasoning_override" ||
+    decision.cause === "plan_mode" ||
+    decision.cause === "insufficient_evidence";
   const scoreExplanation =
-    score !== undefined && decision.cause !== "reasoning_override" && decision.cause !== "plan_mode"
+    score !== undefined && !scoreDidNotDecide
       ? describeScoreAgainstBoundaries(score, tierBoundaries, tierLabel !== undefined)
       : null;
 

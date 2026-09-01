@@ -45,15 +45,26 @@ from .classification_rubrics import BUSINESS_TIER_CRITERIA, calibration_examples
 from .config import (
     DEFAULT_CLASSIFICATION_RUBRIC,
     DEFAULT_CODE_KEYWORDS,
+    DEFAULT_CODE_KEYWORDS_V2,
+    DEFAULT_CONSTRAINT_KEYWORDS,
+    DEFAULT_DIMENSION_WEIGHTS_V2,
+    DEFAULT_DOMAIN_KEYWORDS,
     DEFAULT_ESCALATION_KEYWORDS,
+    DEFAULT_REASONING_DEMAND_KEYWORDS,
     DEFAULT_REASONING_KEYWORDS,
     DEFAULT_SIMPLE_KEYWORDS,
+    DEFAULT_SIMPLE_KEYWORDS_V2,
     DEFAULT_TECHNICAL_KEYWORDS,
     HOUSEKEEPING_ASK_SENTINELS,
     PLAN_MODE_SYSTEM_SENTINELS,
     PLAN_MODE_TAIL_SENTINELS,
     PLAN_MODE_TOOL_NAME,
     TIER_SEVERITY_ORDER,
+    V2_ARTIFACT_NOUNS,
+    V2_AUTHORING_VERBS,
+    V2_CONTEXT_MARKERS,
+    V2_CONTEXT_OPS_HIGH,
+    V2_CONTEXT_OPS_MEDIUM,
     ClassificationRubric,
     ComplexityRouterConfig,
     ComplexityTier,
@@ -791,6 +802,7 @@ class ClassificationOutcome(NamedTuple):
     cause: Literal[
         "heuristic_scorer",
         "reasoning_override",
+        "insufficient_evidence",
         "llm_classifier",
         "heuristic_first_short_circuit",
         "housekeeping",
@@ -882,7 +894,7 @@ class ComplexityRouter(CustomLogger):
         self,
         model_name: str,
         litellm_router_instance: Router,
-        complexity_router_config: dict[str, Any] | None = None,
+        complexity_router_config: Mapping[str, object] | None = None,
         default_model: str | None = None,
         derive_savings_baseline: bool = True,
     ):
@@ -924,13 +936,29 @@ class ComplexityRouter(CustomLogger):
             )
 
         # Build effective keyword lists (use config overrides or defaults)
-        self.code_keywords = self.config.code_keywords or DEFAULT_CODE_KEYWORDS
-        self.reasoning_keywords = self.config.reasoning_keywords or DEFAULT_REASONING_KEYWORDS
+        scorer_v2: Final = self.config.scorer_version == 2
+        self.code_keywords: Sequence[str] = self.config.code_keywords or (
+            DEFAULT_CODE_KEYWORDS_V2 if scorer_v2 else DEFAULT_CODE_KEYWORDS
+        )
+        self.reasoning_keywords: Sequence[str] = self.config.reasoning_keywords or (
+            DEFAULT_REASONING_DEMAND_KEYWORDS if scorer_v2 else DEFAULT_REASONING_KEYWORDS
+        )
         self.technical_keywords = _append_custom_keywords(
             self.config.technical_keywords or DEFAULT_TECHNICAL_KEYWORDS,
             self.config.custom_technical_keywords,
         )
-        self.simple_keywords = self.config.simple_keywords or DEFAULT_SIMPLE_KEYWORDS
+        self.simple_keywords: Sequence[str] = self.config.simple_keywords or (
+            DEFAULT_SIMPLE_KEYWORDS_V2 if scorer_v2 else DEFAULT_SIMPLE_KEYWORDS
+        )
+        # The engineering domain tracks the technical list (custom_technical_keywords included) so
+        # that knob keeps working under v2; an operator domain_keywords entry replaces per domain.
+        self._domain_keywords: Mapping[str, Sequence[str]] = MappingProxyType(
+            {
+                **DEFAULT_DOMAIN_KEYWORDS,
+                "engineering": tuple(self.technical_keywords),
+                **(self.config.domain_keywords or EMPTY_MAPPING),
+            }
+        )
         if self.config.has_custom_tiers:
             self.escalation_keywords: tuple[str, ...] = ()
         elif self.config.escalation_keywords is not None:
@@ -952,12 +980,31 @@ class ComplexityRouter(CustomLogger):
 
         # Pre-compile regex patterns for efficiency
         # Use non-greedy .*? to prevent ReDoS on pathological inputs
+        # v1 only; v2's deliverableCount deliberately has no option-list regexes ("1. ", "a) "),
+        # which match ordinary enumerated prose rather than multi-step work.
         self._multi_step_patterns = [
             re.compile(r"first.*?then", re.IGNORECASE),
             re.compile(r"step\s*\d", re.IGNORECASE),
             re.compile(r"\d+\.\s"),
             re.compile(r"[a-z]\)\s", re.IGNORECASE),
         ]
+        self._deliverable_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(r"\band also\b"),
+            re.compile(r"\bas well as\b"),
+            re.compile(r"\bin addition\b"),
+            re.compile(r"\balong with\b"),
+            re.compile(r"\bfirst\b.*?\bthen\b"),
+            re.compile(r"\bstep\s*\d"),
+        )
+        self._multi_hop_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(r"\bgiven that\b"),
+            re.compile(r"\bbased on (?:the|that)\b"),
+            re.compile(r"\buse that to\b"),
+            re.compile(r"\busing the result\b"),
+            re.compile(r"\bif\b.*?\bthen\b"),
+            re.compile(r"\bwhich would then\b"),
+            re.compile(r"\band from that\b"),
+        )
 
         self.adaptive_router: AdaptiveRouter | None = None
         self._model_tiers: dict[str, tuple[ComplexityTier, ...]] = {}
@@ -1080,7 +1127,7 @@ class ComplexityRouter(CustomLogger):
     def _score_keyword_match(
         self,
         text: str,
-        keywords: list[str],
+        keywords: Sequence[str],
         name: str,
         signal_label: str,
         thresholds: tuple[int, int],  # (low, high)
@@ -1134,7 +1181,12 @@ class ComplexityRouter(CustomLogger):
 
     def _score_and_classify(
         self, prompt: str, system_prompt: str | None = None
-    ) -> tuple[ComplexityTier, float, tuple[str, ...], Literal["heuristic_scorer", "reasoning_override"]]:
+    ) -> tuple[
+        ComplexityTier,
+        float,
+        tuple[str, ...],
+        Literal["heuristic_scorer", "reasoning_override", "insufficient_evidence"],
+    ]:
         """
         Classify a prompt by complexity, reporting whether the score chose the tier.
 
@@ -1148,6 +1200,9 @@ class ComplexityRouter(CustomLogger):
             - score: The raw weighted score
             - signals: List of triggered signals for debugging
         """
+        if self.config.scorer_version == 2:
+            return self._score_and_classify_v2(prompt)
+
         # Score the caller's ask only. The system prompt is a per-session constant, so it
         # carries no information about how requests within a session differ, yet it
         # saturates the keyword thresholds (codePresence trips at 2 matches, which any
@@ -1229,6 +1284,162 @@ class ComplexityRouter(CustomLogger):
             tier = ComplexityTier.REASONING
 
         return tier, weighted_score, tuple(signals), "heuristic_scorer"
+
+    def _effective_dimension_weights_v2(self) -> Mapping[str, float]:
+        """The v2 weight per dimension: shipped provisional defaults, overridden per key by any
+        v2-named entries in dimension_weights. The config field is default-filled with the v1
+        names, so a plain lookup there would zero every v2 dimension."""
+        configured: Final = self.config.dimension_weights
+        return MappingProxyType(
+            {name: configured.get(name, default) for name, default in DEFAULT_DIMENSION_WEIGHTS_V2.items()}
+        )
+
+    def _score_pattern_count(
+        self,
+        name: str,
+        text: str,
+        patterns: Sequence[re.Pattern[str]],
+        signal_label: str,
+        thresholds: tuple[int, int],
+        scores: tuple[float, float, float],
+    ) -> DimensionScore:
+        low_threshold, high_threshold = thresholds
+        score_none, score_low, score_high = scores
+        hits: Final = sum(1 for p in patterns if p.search(text))
+        if hits < low_threshold:
+            return DimensionScore(name, score_none, None)
+        score: Final = score_high if hits >= high_threshold else score_low
+        return DimensionScore(name, score, f"{signal_label} ({hits} markers)")
+
+    def _score_domain_depth(self, text: str) -> tuple[DimensionScore, str | None]:
+        """Depth of the best-matching knowledge domain, plus which domain it was.
+
+        Terminology is supporting evidence only: one stray term scores nothing, and only the
+        single best domain counts so cross-domain word salad cannot stack."""
+        best_domain: str | None = None
+        best_matches: tuple[str, ...] = ()
+        for domain, keywords in self._domain_keywords.items():
+            matches = tuple(kw for kw in keywords if self._keyword_matches(text, kw))
+            if len(matches) > len(best_matches):
+                best_domain = domain  # rebind-ok: running max over the domain loop
+                best_matches = matches  # rebind-ok: running max over the domain loop
+        if len(best_matches) < 2:
+            return DimensionScore("domainDepth", 0, None), None
+        detail: Final = ", ".join(best_matches[:3])
+        score: Final = 1.0 if len(best_matches) >= 4 else 0.5
+        return DimensionScore("domainDepth", score, f"domain ({best_domain}: {detail})"), best_domain
+
+    def _score_output_scope(self, text: str) -> DimensionScore:
+        """Artifacts requested for delivery; counted only next to an authoring verb so naming a
+        report in passing is not an ask to produce one."""
+        if not any(self._keyword_matches(text, verb) for verb in V2_AUTHORING_VERBS):
+            return DimensionScore("outputScope", 0, None)
+        artifacts: Final = tuple(noun for noun in V2_ARTIFACT_NOUNS if self._keyword_matches(text, noun))
+        if not artifacts:
+            return DimensionScore("outputScope", 0, None)
+        score: Final = 1.0 if len(artifacts) >= 2 else 0.4
+        return DimensionScore("outputScope", score, f"artifacts ({', '.join(artifacts[:3])})")
+
+    def _score_context_operation(self, text: str) -> DimensionScore:
+        """The operation demanded over supplied material. The material's presence scores nothing,
+        and neither do bounded operations (copy, extract, translate, summarize), so a mechanical
+        transformation of a large input stays SIMPLE-eligible."""
+        if not any(marker in text for marker in V2_CONTEXT_MARKERS):
+            return DimensionScore("contextOperation", 0, None)
+        high_op: Final = next((op for op in V2_CONTEXT_OPS_HIGH if self._keyword_matches(text, op)), None)
+        if high_op is not None:
+            return DimensionScore("contextOperation", 1.0, f"context op ({high_op})")
+        medium_op: Final = next((op for op in V2_CONTEXT_OPS_MEDIUM if self._keyword_matches(text, op)), None)
+        if medium_op is not None:
+            return DimensionScore("contextOperation", 0.6, f"context op ({medium_op})")
+        return DimensionScore("contextOperation", 0, None)
+
+    def _task_type_dimension(
+        self, text: str, domain: str | None, has_triviality: bool, has_artifacts: bool
+    ) -> DimensionScore:
+        """Descriptive task category. Always scores 0: the design doc forbids task type as a tier
+        prior, so it rides the signals for evaluation and cohort analysis only."""
+        code_matches: Final = sum(1 for kw in self.code_keywords if self._keyword_matches(text, kw))
+        if code_matches >= 2:
+            return DimensionScore("taskType", 0, "task (code)")
+        if domain is not None:
+            return DimensionScore("taskType", 0, f"task ({domain})")
+        if has_artifacts:
+            return DimensionScore("taskType", 0, "task (writing)")
+        if has_triviality:
+            return DimensionScore("taskType", 0, "task (conversation)")
+        return DimensionScore("taskType", 0, None)
+
+    def _score_and_classify_v2(
+        self, prompt: str
+    ) -> tuple[
+        ComplexityTier,
+        float,
+        tuple[str, ...],
+        Literal["heuristic_scorer", "reasoning_override", "insufficient_evidence"],
+    ]:
+        """The scorer_version 2 basis: difficulty evidence from the operations a request demands
+        rather than from software vocabulary, and SIMPLE only on positive evidence of triviality.
+
+        Weights are provisional hand-set defaults pending calibration against public
+        model-outcome data; the mapping semantics are the contract. Like v1, only the caller's
+        ask is scored, never the system prompt."""
+        user_text: Final = prompt.lower()
+
+        triviality, _ = self._score_keyword_match(
+            user_text, self.simple_keywords, "trivialityEvidence", "trivial", (1, 2), (0, -1.0, -1.0)
+        )
+        reasoning, reasoning_match_count = self._score_keyword_match(
+            user_text, self.reasoning_keywords, "reasoningDemand", "reasoning", (1, 2), (0, 0.6, 1.0)
+        )
+        constraints, _ = self._score_keyword_match(
+            user_text, DEFAULT_CONSTRAINT_KEYWORDS, "constraintDensity", "constraints", (2, 4), (0, 0.5, 1.0)
+        )
+        domain_depth, best_domain = self._score_domain_depth(user_text)
+        output_scope: Final = self._score_output_scope(user_text)
+        dimensions: Final[tuple[DimensionScore, ...]] = (
+            triviality,
+            reasoning,
+            constraints,
+            domain_depth,
+            output_scope,
+            self._score_context_operation(user_text),
+            self._score_pattern_count(
+                "deliverableCount", user_text, self._deliverable_patterns, "deliverables", (1, 3), (0, 0.5, 1.0)
+            ),
+            self._score_pattern_count(
+                "multiHop", user_text, self._multi_hop_patterns, "multi-hop", (1, 2), (0, 0.5, 1.0)
+            ),
+            self._task_type_dimension(
+                user_text,
+                domain=best_domain,
+                has_triviality=triviality.signal is not None,
+                has_artifacts=output_scope.signal is not None,
+            ),
+        )
+
+        signals: Final = tuple(d.signal for d in dimensions if d.signal is not None)
+        weights: Final = self._effective_dimension_weights_v2()
+        weighted_score: Final = sum(d.score * weights.get(d.name, 0) for d in dimensions)
+        boundaries: Final = self._effective_tier_boundaries()
+
+        if reasoning_match_count >= 2 and weighted_score >= self._effective_reasoning_override_min_score():
+            return ComplexityTier.REASONING, weighted_score, signals, "reasoning_override"
+
+        if weighted_score >= boundaries["complex_reasoning"]:
+            return ComplexityTier.REASONING, weighted_score, signals, "heuristic_scorer"
+        if weighted_score >= boundaries["medium_complex"]:
+            return ComplexityTier.COMPLEX, weighted_score, signals, "heuristic_scorer"
+        if weighted_score >= boundaries["simple_medium"]:
+            return ComplexityTier.MEDIUM, weighted_score, signals, "heuristic_scorer"
+
+        # Below the boundary, SIMPLE requires positive evidence of triviality with nothing
+        # pointing the other way. A no-match prompt scores 0.0, which is absence of evidence,
+        # not evidence of simplicity, so it and any mixed weak evidence default to MEDIUM.
+        triviality_only: Final = triviality.signal is not None and all(d.score <= 0 for d in dimensions)
+        if triviality_only:
+            return ComplexityTier.SIMPLE, weighted_score, signals, "heuristic_scorer"
+        return ComplexityTier.MEDIUM, weighted_score, signals, "insufficient_evidence"
 
     def _effective_reasoning_override_min_score(self) -> float:
         """The score a request must reach before the reasoning-marker override may promote it.
@@ -1378,9 +1589,15 @@ class ComplexityRouter(CustomLogger):
         tier, score, signals, cause = self._score_and_classify(prompt, system_prompt)
         scored: Final = ClassificationOutcome(tier=tier, score=score, signals=signals, cause=cause)
         threshold: Final = self.config.heuristic_first_max_tier
+        # Under v2 the scorer names its own abstention: insufficient_evidence means the tier is a
+        # default, not a decision, so it never short-circuits even though a zero-weight taskType
+        # signal may be present. v1 has no such cause and keeps the signals gate.
+        decided_by_evidence: Final = (
+            cause != "insufficient_evidence" if self.config.scorer_version == 2 else bool(signals)
+        )
         decided_cheaply: Final = (
             threshold is not None
-            and bool(signals)
+            and decided_by_evidence
             and self._active_tier_severity(tier) <= self._active_tier_severity(threshold)
         )
         if decided_cheaply:

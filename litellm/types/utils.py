@@ -2844,6 +2844,10 @@ RoutingDecisionCause = Literal[
     # that tells a reader the score did NOT choose the tier; encoding it as free text
     # meant anything that filtered `signals` silently changed what the row claimed.
     "reasoning_override",
+    # scorer_version 2 only: the score sat below simple_medium without positive evidence of
+    # triviality, so the scorer defaulted to MEDIUM instead of mapping the score. Empty
+    # `signals` means no dimension fired at all; non-empty means mixed or weak evidence.
+    "insufficient_evidence",
     "llm_classifier",
     # classifier_type 'heuristic_first': the local scorer produced at least one signal and landed at
     # or below heuristic_first_max_tier, so it decided the tier and the LLM classifier was never
