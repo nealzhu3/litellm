@@ -978,20 +978,35 @@ class OpenAIChatCompletionsHandler(BaseTranslation):
         chunks: each rewritten choice's full text lands in its first
         content-carrying chunk and the rest are blanked, the same shape the
         in-flight write-back uses. Chunks carrying only finish_reason or usage
-        stay untouched."""
+        stay untouched.
+
+        Keyed by ``StreamingChoices.index``, not ``enumerate`` position: on
+        ``n>1`` streams each chunk typically carries a single non-zero-indexed
+        choice, so ``enumerate`` would collapse every rewrite onto position 0."""
         post_guardrail_texts: Final = self._string_choice_contents(guardrailed_response)
-        changed: Final = tuple(
-            (choice_idx, after)
+        rewrites_by_choice_index: Final[dict[int, str]] = {
+            choice_idx: after
             for choice_idx, (before, after) in enumerate(zip(pre_guardrail_texts, post_guardrail_texts))
             if before is not None and after is not None and after != before
-        )
-        if not changed:
+        }
+        if not rewrites_by_choice_index:
             return
-        await self._apply_guardrail_responses_to_output_streaming(
-            responses=responses_so_far,
-            guardrailed_texts=[after for _choice_idx, after in changed],  # mutable-ok: callee takes lists
-            task_mappings=[(choice_idx, None) for choice_idx, _after in changed],  # mutable-ok: callee takes lists
-        )
+        already_written: Final[dict[int, bool]] = {}
+        for response in responses_so_far:
+            for choice in response.choices:
+                if not isinstance(choice, litellm.StreamingChoices):
+                    continue
+                content = choice.delta.content
+                if not isinstance(content, str) or not content:
+                    continue
+                idx = choice.index if isinstance(choice.index, int) else 0
+                if idx not in rewrites_by_choice_index:
+                    continue
+                if idx in already_written:
+                    choice.delta.content = ""
+                else:
+                    choice.delta.content = rewrites_by_choice_index[idx]
+                    already_written[idx] = True
 
     async def _apply_guardrail_responses_to_output_streaming(
         self,

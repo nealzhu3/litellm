@@ -84,6 +84,7 @@ class ResponsesStreamChunk(TypedDict, total=False):
 
     type: ReadOnly[str]
     text: ReadOnly[str]
+    delta: ReadOnly[str]
 
 
 _TERMINAL_ENVELOPE_EVENT_TYPES: Final = frozenset(
@@ -749,10 +750,14 @@ class OpenAIResponsesHandler(BaseTranslation):
         )
 
     def get_streaming_string_so_far(self, responses_so_far: Sequence[ResponsesStreamChunk]) -> str:
-        """
-        Get the string so far from the responses so far.
-        """
-        return "".join([response.get("text", "") for response in responses_so_far])
+        """Get the string so far from the responses so far.
+
+        Responses events carry text on ``response.output_text.delta`` in
+        ``delta`` and on ``.done`` events in ``text``; read both so a stream
+        whose tail is only deltas (no terminal envelope, no ``.done``) still
+        contributes its content, letting the fallback path invoke the
+        guardrail and fail closed on rewrites instead of leaking raw output."""
+        return "".join(response.get("text") or response.get("delta") or "" for response in responses_so_far)
 
     def _has_text_content(self, response: "ResponsesAPIResponse") -> bool:
         """
